@@ -63,18 +63,6 @@
         "utility"
       ],
       "priority_score": 8
-    },
-    "SECURITY_ALERTS": {
-      "keywords": [
-        "security alert",
-        "verification code",
-        "2fa",
-        "password reset",
-        "unauthorized",
-        "suspicious sign-in",
-        "compromised"
-      ],
-      "priority_score": 10
     }
   }
 }

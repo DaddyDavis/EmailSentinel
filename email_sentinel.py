@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import email
+import socket
 import imaplib
 import threading
 import msvcrt
@@ -21,22 +22,38 @@ import notifier
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 HISTORY_PATH = os.path.join(os.path.dirname(__file__), "alerts_history.json")
+SEEN_PATH = os.path.join(os.path.dirname(__file__), "processed_ids.json")
 
 console = Console()
 
 class EmailSentinel:
     def __init__(self):
+        self.lock_socket = self.acquire_single_instance_lock()
         self.config = self.load_config()
         self.running = True
         self.last_scan_time = "Never"
         self.connection_status = "INITIALIZING"
-        self.status_detail = "Loading configuration..."
+        self.status_detail = "Calibrating baseline..."
         self.next_poll_countdown = self.config.get("poll_interval_seconds", 60)
-        self.processed_ids = set()
+        self.processed_ids = self.load_processed_ids()
+        self.baseline_established = len(self.processed_ids) > 0
         self.alerts_history = self.load_history()
         self.sound_enabled = self.config.get("sound_alerts", True)
         self.voice_enabled = self.config.get("voice_tts", True)
         self.toast_enabled = self.config.get("toast_notifications", True)
+
+    def acquire_single_instance_lock(self):
+        """Prevent multiple instances from running simultaneously."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 28799))
+            s.listen(1)
+            return s
+        except socket.error:
+            console.print("\n[bold red]ERROR: Another instance of EmailSentinel is already running![/bold red]")
+            console.print("[yellow]Exiting to prevent duplicate notifications.[/yellow]\n")
+            time.sleep(3)
+            sys.exit(0)
 
     def load_config(self):
         if os.path.exists(CONFIG_PATH):
@@ -47,10 +64,20 @@ class EmailSentinel:
                 pass
         return {}
 
-    def save_config(self):
+    def load_processed_ids(self):
+        if os.path.exists(SEEN_PATH):
+            try:
+                with open(SEEN_PATH, "r", encoding="utf-8") as f:
+                    return set(json.load(f))
+            except Exception:
+                pass
+        return set()
+
+    def save_processed_ids(self):
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2)
+            with open(SEEN_PATH, "w", encoding="utf-8") as f:
+                # Keep latest 1000 IDs
+                json.dump(list(self.processed_ids)[-1000:], f)
         except Exception:
             pass
 
@@ -118,26 +145,39 @@ class EmailSentinel:
 
         try:
             self.connection_status = "CONNECTING"
-            self.status_detail = f"Contacting {server_host}:{port}..."
             mail = imaplib.IMAP4_SSL(server_host, port)
             mail.login(user, password)
             self.connection_status = "ONLINE"
-            self.status_detail = "Connected and scanning INBOX"
-
             mail.select("INBOX", readonly=True)
 
-            # Search unread messages first, or last 30 messages
+            # 1. First-Run Baseline Calibration: Ignore all historical emails
+            if not self.baseline_established:
+                self.status_detail = "Calibrating baseline... ignoring historical emails"
+                # Record all unread message IDs as known
+                status, unread_resp = mail.search(None, "UNSEEN")
+                if status == "OK" and unread_resp[0]:
+                    for mid in unread_resp[0].split():
+                        self.processed_ids.add(mid.decode("utf-8", errors="ignore"))
+
+                # Record last 50 total message IDs as known
+                status, all_resp = mail.search(None, "ALL")
+                if status == "OK" and all_resp[0]:
+                    for mid in all_resp[0].split()[-50:]:
+                        self.processed_ids.add(mid.decode("utf-8", errors="ignore"))
+
+                self.baseline_established = True
+                self.save_processed_ids()
+                self.last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.status_detail = f"Baseline locked. Ignored {len(self.processed_ids)} old emails."
+                mail.close()
+                mail.logout()
+                return
+
+            # 2. Routine Polling: Only check unread (UNSEEN) emails
             status, unread_resp = mail.search(None, "UNSEEN")
             candidate_ids = []
             if status == "OK" and unread_resp[0]:
                 candidate_ids = unread_resp[0].split()
-
-            # If no unread, check last 15 recent messages to ensure nothing missed
-            if len(candidate_ids) < 5:
-                status, all_resp = mail.search(None, "ALL")
-                if status == "OK" and all_resp[0]:
-                    all_ids = all_resp[0].split()
-                    candidate_ids = list(set(candidate_ids + all_ids[-15:]))
 
             new_alerts_count = 0
 
@@ -147,6 +187,7 @@ class EmailSentinel:
                     continue
 
                 self.processed_ids.add(msg_id_str)
+                self.save_processed_ids()
 
                 # Fetch headers
                 status, data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
@@ -158,7 +199,6 @@ class EmailSentinel:
 
                 sender = self.decode_mime_words(msg.get("From", "Unknown"))
                 subject = self.decode_mime_words(msg.get("Subject", "No Subject"))
-                date_str = msg.get("Date", "")
 
                 category, score, keyword = self.classify_email(sender, subject)
 
@@ -185,13 +225,17 @@ class EmailSentinel:
                     )
 
             self.last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.status_detail = f"Scan complete. {new_alerts_count} priority alerts flagged."
+            if new_alerts_count > 0:
+                self.status_detail = f"New alert: {new_alerts_count} priority email(s) found!"
+            else:
+                self.status_detail = "Inbox clear. No new priority messages."
+
             mail.close()
             mail.logout()
 
-        except imaplib.IMAP4.error as e:
+        except imaplib.IMAP4.error:
             self.connection_status = "AUTH FAILED"
-            self.status_detail = "Invalid Google App Password. Generate new key."
+            self.status_detail = "Invalid Google App Password."
         except Exception as e:
             self.connection_status = "ERROR"
             self.status_detail = notifier.sanitize_text(str(e))[:50]
@@ -234,7 +278,6 @@ class EmailSentinel:
         status_table.add_row("Email Account", self.config.get("email_user", "N/A"))
         status_table.add_row("Server", f"{self.config.get('imap_server', 'imap.gmail.com')}:{self.config.get('imap_port', 993)}")
 
-        # Status color
         stat_color = "green" if self.connection_status == "ONLINE" else "red" if "AUTH" in self.connection_status else "yellow"
         status_table.add_row("Status", f"[{stat_color}]{self.connection_status}[/{stat_color}]")
         status_table.add_row("Detail", self.status_detail[:35])
@@ -252,8 +295,6 @@ class EmailSentinel:
         channels_text.append("Bienville Ortho, Appointments, Prescriptions\n", style="white")
         channels_text.append("[FINANCIAL] ", style="bold green")
         channels_text.append("Past Due, Invoices, Due Dates, Utilities\n", style="white")
-        channels_text.append("[SECURITY] ", style="bold red")
-        channels_text.append("2FA Codes, Password Resets, Alerts\n", style="white")
 
         status_content = Layout()
         status_content.split_column(
@@ -303,13 +344,11 @@ class EmailSentinel:
         return layout
 
     def run(self):
-        # Start background polling thread
         worker_thread = threading.Thread(target=self.background_poll_worker, daemon=True)
         worker_thread.start()
 
         with Live(self.build_layout(), refresh_per_second=2, screen=True) as live:
             while self.running:
-                # Handle non-blocking key presses
                 if msvcrt.kbhit():
                     ch = msvcrt.getch().decode("utf-8", errors="ignore").lower()
                     if ch == "q":
@@ -323,7 +362,7 @@ class EmailSentinel:
                         notifier.trigger_notification(
                             "LEGAL",
                             "Tyler Gray (Morgan and Morgan)",
-                            "Urgent settlement document review",
+                            "Test alert: Settlement update review",
                             toast=self.toast_enabled,
                             voice=self.voice_enabled
                         )
