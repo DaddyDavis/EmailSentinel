@@ -1,0 +1,80 @@
+{
+  "email_user": "daddy.davis.601@gmail.com",
+  "email_pass": "",
+  "imap_server": "imap.gmail.com",
+  "imap_port": 993,
+  "poll_interval_seconds": 60,
+  "toast_notifications": true,
+  "sound_alerts": true,
+  "voice_tts": true,
+  "priority_categories": {
+    "LEGAL": {
+      "keywords": [
+        "tyler gray",
+        "paralegal",
+        "morgan and morgan",
+        "morgan & morgan",
+        "forthepeople",
+        "settlement",
+        "court",
+        "attorney"
+      ],
+      "priority_score": 10
+    },
+    "DEVRY_ACADEMIC": {
+      "keywords": [
+        "devry",
+        "canvas",
+        "judith",
+        "julie",
+        "financial aid",
+        "fafsa",
+        "student loans",
+        "disbursement",
+        "professor",
+        "grade",
+        "assignment"
+      ],
+      "priority_score": 9
+    },
+    "MEDICAL": {
+      "keywords": [
+        "bienville ortho",
+        "bienville",
+        "ortho",
+        "orthopaedic",
+        "doctor",
+        "clinic",
+        "prescription",
+        "appointment",
+        "radiology"
+      ],
+      "priority_score": 9
+    },
+    "BILLS_FINANCIAL": {
+      "keywords": [
+        "past due",
+        "due date",
+        "bill due",
+        "invoice",
+        "statement available",
+        "payment required",
+        "minimum payment",
+        "utility"
+      ],
+      "priority_score": 8
+    },
+    "SECURITY_ALERTS": {
+      "keywords": [
+        "security alert",
+        "verification code",
+        "2fa",
+        "password reset",
+        "unauthorized",
+        "suspicious sign-in",
+        "compromised"
+      ],
+      "priority_score": 10
+    }
+  }
+}

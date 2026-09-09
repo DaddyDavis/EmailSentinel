@@ -1,0 +1,342 @@
+import os
+import sys
+import json
+import time
+import email
+import imaplib
+import threading
+import msvcrt
+import webbrowser
+from datetime import datetime
+from email.header import decode_header
+
+from rich.console import Console
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.live import Live
+
+import notifier
+
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+HISTORY_PATH = os.path.join(os.path.dirname(__file__), "alerts_history.json")
+
+console = Console()
+
+class EmailSentinel:
+    def __init__(self):
+        self.config = self.load_config()
+        self.running = True
+        self.last_scan_time = "Never"
+        self.connection_status = "INITIALIZING"
+        self.status_detail = "Loading configuration..."
+        self.next_poll_countdown = self.config.get("poll_interval_seconds", 60)
+        self.processed_ids = set()
+        self.alerts_history = self.load_history()
+        self.sound_enabled = self.config.get("sound_alerts", True)
+        self.voice_enabled = self.config.get("voice_tts", True)
+        self.toast_enabled = self.config.get("toast_notifications", True)
+
+    def load_config(self):
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def save_config(self):
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=2)
+        except Exception:
+            pass
+
+    def load_history(self):
+        if os.path.exists(HISTORY_PATH):
+            try:
+                with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return []
+
+    def save_history(self):
+        try:
+            with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.alerts_history[-100:], f, indent=2)
+        except Exception:
+            pass
+
+    def decode_mime_words(self, raw_header):
+        if not raw_header:
+            return ""
+        try:
+            decoded_list = decode_header(raw_header)
+            parts = []
+            for text, encoding in decoded_list:
+                if isinstance(text, bytes):
+                    parts.append(text.decode(encoding if encoding else "utf-8", errors="ignore"))
+                else:
+                    parts.append(str(text))
+            return "".join(parts)
+        except Exception:
+            return str(raw_header)
+
+    def classify_email(self, sender, subject, body_snippet=""):
+        combined_text = f"{sender} {subject} {body_snippet}".lower()
+        categories = self.config.get("priority_categories", {})
+
+        matched_category = None
+        highest_score = 0
+        matched_keyword = None
+
+        for cat_name, cat_data in categories.items():
+            keywords = cat_data.get("keywords", [])
+            score = cat_data.get("priority_score", 5)
+            for kw in keywords:
+                if kw.lower() in combined_text:
+                    if score > highest_score:
+                        highest_score = score
+                        matched_category = cat_name
+                        matched_keyword = kw
+
+        return matched_category, highest_score, matched_keyword
+
+    def check_inbox(self):
+        user = self.config.get("email_user", "")
+        password = self.config.get("email_pass", "").strip()
+        server_host = self.config.get("imap_server", "imap.gmail.com")
+        port = self.config.get("imap_port", 993)
+
+        if not password:
+            self.connection_status = "AUTH REQUIRED"
+            self.status_detail = "Add Google App Password to config.json"
+            return
+
+        try:
+            self.connection_status = "CONNECTING"
+            self.status_detail = f"Contacting {server_host}:{port}..."
+            mail = imaplib.IMAP4_SSL(server_host, port)
+            mail.login(user, password)
+            self.connection_status = "ONLINE"
+            self.status_detail = "Connected and scanning INBOX"
+
+            mail.select("INBOX", readonly=True)
+
+            # Search unread messages first, or last 30 messages
+            status, unread_resp = mail.search(None, "UNSEEN")
+            candidate_ids = []
+            if status == "OK" and unread_resp[0]:
+                candidate_ids = unread_resp[0].split()
+
+            # If no unread, check last 15 recent messages to ensure nothing missed
+            if len(candidate_ids) < 5:
+                status, all_resp = mail.search(None, "ALL")
+                if status == "OK" and all_resp[0]:
+                    all_ids = all_resp[0].split()
+                    candidate_ids = list(set(candidate_ids + all_ids[-15:]))
+
+            new_alerts_count = 0
+
+            for msg_id in candidate_ids:
+                msg_id_str = msg_id.decode("utf-8") if isinstance(msg_id, bytes) else str(msg_id)
+                if msg_id_str in self.processed_ids:
+                    continue
+
+                self.processed_ids.add(msg_id_str)
+
+                # Fetch headers
+                status, data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+                if status != "OK" or not data or not data[0]:
+                    continue
+
+                raw_email_bytes = data[0][1]
+                msg = email.message_from_bytes(raw_email_bytes)
+
+                sender = self.decode_mime_words(msg.get("From", "Unknown"))
+                subject = self.decode_mime_words(msg.get("Subject", "No Subject"))
+                date_str = msg.get("Date", "")
+
+                category, score, keyword = self.classify_email(sender, subject)
+
+                if category:
+                    alert_item = {
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "category": category,
+                        "score": score,
+                        "sender": notifier.sanitize_text(sender),
+                        "subject": notifier.sanitize_text(subject),
+                        "keyword": keyword
+                    }
+                    self.alerts_history.insert(0, alert_item)
+                    self.save_history()
+                    new_alerts_count += 1
+
+                    # Trigger audio and toast notifications
+                    notifier.trigger_notification(
+                        category,
+                        sender,
+                        subject,
+                        toast=self.toast_enabled,
+                        voice=self.voice_enabled
+                    )
+
+            self.last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.status_detail = f"Scan complete. {new_alerts_count} priority alerts flagged."
+            mail.close()
+            mail.logout()
+
+        except imaplib.IMAP4.error as e:
+            self.connection_status = "AUTH FAILED"
+            self.status_detail = "Invalid Google App Password. Generate new key."
+        except Exception as e:
+            self.connection_status = "ERROR"
+            self.status_detail = notifier.sanitize_text(str(e))[:50]
+
+    def background_poll_worker(self):
+        while self.running:
+            self.check_inbox()
+            interval = self.config.get("poll_interval_seconds", 60)
+            self.next_poll_countdown = interval
+            while self.next_poll_countdown > 0 and self.running:
+                time.sleep(1)
+                self.next_poll_countdown -= 1
+
+    def build_layout(self):
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="main", ratio=1),
+            Layout(name="footer", size=3)
+        )
+
+        # Header
+        header_text = Text()
+        header_text.append("EMAIL SENTINEL ", style="bold green")
+        header_text.append("| PRIORITY INBOX MONITOR & RAPID TRIAGE HUD", style="bold white")
+        header_panel = Panel(header_text, style="green on #030508", border_style="green")
+        layout["header"].update(header_panel)
+
+        # Main Area: Split horizontal
+        layout["main"].split_row(
+            Layout(name="status_panel", ratio=1),
+            Layout(name="alerts_table", ratio=2)
+        )
+
+        # Status & Channels
+        status_table = Table(box=None, expand=True, show_header=False)
+        status_table.add_column("Key", style="bold cyan", width=16)
+        status_table.add_column("Val", style="bold white")
+
+        status_table.add_row("Email Account", self.config.get("email_user", "N/A"))
+        status_table.add_row("Server", f"{self.config.get('imap_server', 'imap.gmail.com')}:{self.config.get('imap_port', 993)}")
+
+        # Status color
+        stat_color = "green" if self.connection_status == "ONLINE" else "red" if "AUTH" in self.connection_status else "yellow"
+        status_table.add_row("Status", f"[{stat_color}]{self.connection_status}[/{stat_color}]")
+        status_table.add_row("Detail", self.status_detail[:35])
+        status_table.add_row("Last Scanned", self.last_scan_time)
+        status_table.add_row("Next Poll In", f"{self.next_poll_countdown} seconds")
+        status_table.add_row("Audio Alerts", "[green]ENABLED[/green]" if self.sound_enabled else "[dim]MUTED[/dim]")
+        status_table.add_row("Toast Popups", "[green]ENABLED[/green]" if self.toast_enabled else "[dim]DISABLED[/dim]")
+
+        channels_text = Text("\nACTIVE PRIORITY WATCHLIST:\n", style="bold yellow")
+        channels_text.append("[LEGAL] ", style="bold red")
+        channels_text.append("Tyler Gray, Morgan and Morgan, Court\n", style="white")
+        channels_text.append("[ACADEMIC] ", style="bold cyan")
+        channels_text.append("DeVry, Canvas, Judith, Julie, Aid\n", style="white")
+        channels_text.append("[MEDICAL] ", style="bold magenta")
+        channels_text.append("Bienville Ortho, Appointments, Prescriptions\n", style="white")
+        channels_text.append("[FINANCIAL] ", style="bold green")
+        channels_text.append("Past Due, Invoices, Due Dates, Utilities\n", style="white")
+        channels_text.append("[SECURITY] ", style="bold red")
+        channels_text.append("2FA Codes, Password Resets, Alerts\n", style="white")
+
+        status_content = Layout()
+        status_content.split_column(
+            Layout(status_table, size=9),
+            Layout(channels_text)
+        )
+        layout["main"]["status_panel"].update(Panel(status_content, title="Sentinel Telemetry", border_style="cyan"))
+
+        # Alerts Stream
+        alerts_table = Table(expand=True, border_style="blue")
+        alerts_table.add_column("Time", style="dim", width=10)
+        alerts_table.add_column("Category", style="bold", width=16)
+        alerts_table.add_column("Sender", style="cyan", width=22)
+        alerts_table.add_column("Subject", style="white")
+
+        if not self.alerts_history:
+            alerts_table.add_row("--:--:--", "[INFO] IDLE", "Sentinel Daemon", "Listening for incoming priority messages...")
+        else:
+            for item in self.alerts_history[:10]:
+                cat = item.get("category", "INFO")
+                color = "red" if cat == "LEGAL" else "cyan" if "DEVRY" in cat else "magenta" if cat == "MEDICAL" else "green"
+                alerts_table.add_row(
+                    item.get("timestamp", "--:--:--"),
+                    f"[{color}]{cat}[/{color}]",
+                    item.get("sender", "Unknown")[:20],
+                    item.get("subject", "No Subject")[:45]
+                )
+
+        layout["main"]["alerts_table"].update(Panel(alerts_table, title="Live Priority Triage Alerts", border_style="green"))
+
+        # Footer
+        footer_text = Text(" CONTROLS: ", style="bold yellow")
+        footer_text.append("[S] ", style="bold green")
+        footer_text.append("Scan Now  |  ", style="white")
+        footer_text.append("[O] ", style="bold cyan")
+        footer_text.append("Open Web Gmail  |  ", style="white")
+        footer_text.append("[T] ", style="bold magenta")
+        footer_text.append("Test Alert Popup  |  ", style="white")
+        footer_text.append("[M] ", style="bold yellow")
+        footer_text.append("Toggle Audio  |  ", style="white")
+        footer_text.append("[Q] ", style="bold red")
+        footer_text.append("Quit Sentinel", style="white")
+
+        footer_panel = Panel(footer_text, style="white on #030508", border_style="yellow")
+        layout["footer"].update(footer_panel)
+
+        return layout
+
+    def run(self):
+        # Start background polling thread
+        worker_thread = threading.Thread(target=self.background_poll_worker, daemon=True)
+        worker_thread.start()
+
+        with Live(self.build_layout(), refresh_per_second=2, screen=True) as live:
+            while self.running:
+                # Handle non-blocking key presses
+                if msvcrt.kbhit():
+                    ch = msvcrt.getch().decode("utf-8", errors="ignore").lower()
+                    if ch == "q":
+                        self.running = False
+                        break
+                    elif ch == "s":
+                        threading.Thread(target=self.check_inbox, daemon=True).start()
+                    elif ch == "o":
+                        webbrowser.open("https://mail.google.com")
+                    elif ch == "t":
+                        notifier.trigger_notification(
+                            "LEGAL",
+                            "Tyler Gray (Morgan and Morgan)",
+                            "Urgent settlement document review",
+                            toast=self.toast_enabled,
+                            voice=self.voice_enabled
+                        )
+                    elif ch == "m":
+                        self.sound_enabled = not self.sound_enabled
+                        self.voice_enabled = not self.voice_enabled
+
+                live.update(self.build_layout())
+                time.sleep(0.5)
+
+def main():
+    sentinel = EmailSentinel()
+    sentinel.run()
+
+if __name__ == "__main__":
+    main()
