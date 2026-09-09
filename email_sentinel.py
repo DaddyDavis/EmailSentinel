@@ -59,17 +59,18 @@ class EmailSentinel:
         self.toast_enabled = self.config.get("toast_notifications", True)
 
     def acquire_single_instance_lock(self):
-        """Prevent multiple instances from running simultaneously."""
+        """Prevent multiple instances from running simultaneously using Windows Named Mutex."""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind(("127.0.0.1", 28799))
-            s.listen(1)
-            return s
-        except socket.error:
-            console.print("\n[bold red]ERROR: Another instance of EmailSentinel is already running![/bold red]")
-            console.print("[yellow]Exiting to prevent duplicate notifications.[/yellow]\n")
-            time.sleep(3)
-            sys.exit(0)
+            import win32event, win32api, winerror
+            mutex = win32event.CreateMutex(None, False, "Global\\EmailSentinel_SingleInstance_Mutex")
+            if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+                console.print("\n[bold red]ERROR: Another instance of EmailSentinel is already running![/bold red]")
+                console.print("[yellow]Exiting to prevent duplicate notifications.[/yellow]\n")
+                time.sleep(2)
+                sys.exit(0)
+            return mutex
+        except Exception:
+            return None
 
     def load_config(self):
         if os.path.exists(CONFIG_PATH):
