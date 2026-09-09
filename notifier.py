@@ -5,6 +5,7 @@ import re
 
 try:
     import win32com.client
+    import pythoncom
     HAS_SAPI = True
 except ImportError:
     HAS_SAPI = False
@@ -13,9 +14,7 @@ def sanitize_text(text):
     """Ensure text strictly uses alphanumeric characters and basic punctuation."""
     if not text:
         return ""
-    # Strip any non-ascii characters
     clean = re.sub(r'[^\x20-\x7E]', ' ', text)
-    # Replace single quotes or backticks to avoid shell injection
     clean = clean.replace("'", "").replace('"', '').replace('`', '')
     return clean.strip()
 
@@ -42,11 +41,15 @@ def _run_toast(title, message):
 
 def _run_voice(text):
     try:
-        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        # High-tech acoustic dual chime
+        winsound.Beep(880, 100)
+        winsound.Beep(1320, 150)
         if HAS_SAPI:
+            pythoncom.CoInitialize()
             speaker = win32com.client.Dispatch("SAPI.SpVoice")
             speaker.Rate = 1
             speaker.Speak(text)
+            pythoncom.CoUninitialize()
     except Exception:
         pass
 
