@@ -8,6 +8,7 @@ import imaplib
 import threading
 import msvcrt
 import webbrowser
+import ctypes
 from datetime import datetime
 from email.header import decode_header
 
@@ -19,6 +20,21 @@ from rich.text import Text
 from rich.live import Live
 
 import notifier
+
+# Register isolated Taskbar identity and custom window icon in Windows
+try:
+    myappid = "DaddyDavis.EmailSentinel.LiveHUD.1.0"
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if hwnd:
+        ico_path = os.path.join(os.path.dirname(__file__), "emailsentinel.ico")
+        if os.path.exists(ico_path):
+            h_icon = ctypes.windll.user32.LoadImageW(None, ico_path, 1, 32, 32, 0x00000010 | 0x00000040)
+            if h_icon:
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, h_icon)
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, h_icon)
+except Exception:
+    pass
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 HISTORY_PATH = os.path.join(os.path.dirname(__file__), "alerts_history.json")
