@@ -47,6 +47,7 @@ def _run_voice(text):
         if HAS_SAPI:
             pythoncom.CoInitialize()
             speaker = win32com.client.Dispatch("SAPI.SpVoice")
+            speaker.Volume = 100
             speaker.Rate = 1
             speaker.Speak(text)
             pythoncom.CoUninitialize()

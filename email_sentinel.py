@@ -9,7 +9,7 @@ import threading
 import msvcrt
 import webbrowser
 import ctypes
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.header import decode_header
 from PIL import Image
 
@@ -105,7 +105,7 @@ class EmailSentinel:
     def save_processed_ids(self):
         try:
             with open(SEEN_PATH, "w", encoding="utf-8") as f:
-                json.dump(list(self.processed_ids)[-1000:], f)
+                json.dump(list(self.processed_ids)[-5000:], f)
         except Exception:
             pass
 
@@ -171,6 +171,9 @@ class EmailSentinel:
             self.status_detail = "Add Google App Password to config.json"
             return
 
+        max_days = int(self.config.get("max_history_days", 14))
+        cutoff_date = (datetime.now() - timedelta(days=max_days)).strftime("%d-%b-%Y")
+
         try:
             self.connection_status = "CONNECTING"
             mail = imaplib.IMAP4_SSL(server_host, port)
@@ -178,34 +181,52 @@ class EmailSentinel:
             self.connection_status = "ONLINE"
             mail.select("INBOX", readonly=True)
 
-            # First-Run Baseline Calibration: Ignore all historical emails
+            # First-Run Baseline Calibration: Index past emails up to 14 days without firing popups
             if not self.baseline_established:
-                self.status_detail = "Calibrating baseline... ignoring old emails"
-                status, unread_resp = mail.search(None, "UNSEEN")
-                if status == "OK" and unread_resp[0]:
-                    for mid in unread_resp[0].split():
+                self.status_detail = f"Indexing past {max_days} days (since {cutoff_date})..."
+                status, window_resp = mail.search(None, f'(SINCE "{cutoff_date}")')
+                if status == "OK" and window_resp[0]:
+                    for mid in window_resp[0].split():
                         self.processed_ids.add(mid.decode("utf-8", errors="ignore"))
 
-                status, all_resp = mail.search(None, "ALL")
-                if status == "OK" and all_resp[0]:
-                    for mid in all_resp[0].split()[-100:]:
-                        self.processed_ids.add(mid.decode("utf-8", errors="ignore"))
+                # Ingest recent unread priority messages into HUD table silently (no popups)
+                status, unread_resp = mail.search(None, f'(UNSEEN SINCE "{cutoff_date}")')
+                if status == "OK" and unread_resp[0]:
+                    recent_unreads = unread_resp[0].split()[-20:]
+                    for mid in recent_unreads:
+                        st, data = mail.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+                        if st == "OK" and data and data[0]:
+                            raw_email_bytes = data[0][1]
+                            msg = email.message_from_bytes(raw_email_bytes)
+                            sender = self.decode_mime_words(msg.get("From", "Unknown"))
+                            subject = self.decode_mime_words(msg.get("Subject", "No Subject"))
+                            category, score, keyword = self.classify_email(sender, subject)
+                            if category:
+                                self.alerts_history.insert(0, {
+                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                    "category": category,
+                                    "score": score,
+                                    "sender": notifier.sanitize_text(sender),
+                                    "subject": notifier.sanitize_text(subject),
+                                    "keyword": keyword
+                                })
 
                 self.baseline_established = True
                 self.save_processed_ids()
+                self.save_history()
                 self.last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self.status_detail = f"Baseline locked. Ignored {len(self.processed_ids)} old emails."
+                self.status_detail = f"Baseline locked ({len(self.processed_ids)} emails indexed, 0 popups)."
                 mail.close()
                 mail.logout()
                 return
 
-            # Routine Polling: Only check unread (UNSEEN) emails
-            status, unread_resp = mail.search(None, "UNSEEN")
+            # Routine Polling: Only search unread emails from the past max_history_days
+            status, unread_resp = mail.search(None, f'(UNSEEN SINCE "{cutoff_date}")')
             candidate_ids = []
             if status == "OK" and unread_resp[0]:
                 candidate_ids = unread_resp[0].split()
 
-            new_alerts_count = 0
+            new_alerts = []
 
             for msg_id in candidate_ids:
                 msg_id_str = msg_id.decode("utf-8") if isinstance(msg_id, bytes) else str(msg_id)
@@ -238,20 +259,33 @@ class EmailSentinel:
                     }
                     self.alerts_history.insert(0, alert_item)
                     self.save_history()
-                    new_alerts_count += 1
+                    new_alerts.append(alert_item)
 
-                    # Trigger audio and toast notifications
+            # Fire notifications with strict rate-limiting to prevent pop-up spam
+            if new_alerts:
+                if len(new_alerts) <= 3:
+                    for alert in new_alerts:
+                        notifier.trigger_notification(
+                            alert["category"],
+                            alert["sender"],
+                            alert["subject"],
+                            toast=self.toast_enabled,
+                            voice=self.voice_enabled
+                        )
+                else:
+                    # Single consolidated notification if multiple emails arrive at once
+                    categories = list({a["category"] for a in new_alerts})
                     notifier.trigger_notification(
-                        category,
-                        sender,
-                        subject,
+                        ", ".join(categories[:2]),
+                        f"{len(new_alerts)} New Priority Emails",
+                        f"Latest: {new_alerts[0]['subject']}",
                         toast=self.toast_enabled,
                         voice=self.voice_enabled
                     )
 
             self.last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if new_alerts_count > 0:
-                self.status_detail = f"New alert: {new_alerts_count} priority email(s) found!"
+            if new_alerts:
+                self.status_detail = f"New alert: {len(new_alerts)} priority email(s) found!"
             else:
                 self.status_detail = "Inbox clear. No new priority messages."
 

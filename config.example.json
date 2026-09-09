@@ -4,6 +4,7 @@
   "imap_server": "imap.gmail.com",
   "imap_port": 993,
   "poll_interval_seconds": 60,
+  "max_history_days": 14,
   "toast_notifications": true,
   "sound_alerts": true,
   "voice_tts": true,
