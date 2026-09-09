@@ -11,6 +11,12 @@ import webbrowser
 import ctypes
 from datetime import datetime
 from email.header import decode_header
+from PIL import Image
+
+import pystray
+from pystray import MenuItem as item
+import win32gui
+import win32con
 
 from rich.console import Console
 from rich.layout import Layout
@@ -21,30 +27,30 @@ from rich.live import Live
 
 import notifier
 
-# Register isolated Taskbar identity and custom window icon in Windows
+APP_TITLE = "EmailSentinel: Priority Inbox Monitor"
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+HISTORY_PATH = os.path.join(os.path.dirname(__file__), "alerts_history.json")
+SEEN_PATH = os.path.join(os.path.dirname(__file__), "processed_ids.json")
+ICO_PATH = os.path.join(os.path.dirname(__file__), "emailsentinel.ico")
+
+console = Console()
+
+# Inject Windows Taskbar AppUserModelID and window icon
 try:
     myappid = "DaddyDavis.EmailSentinel.LiveHUD.1.0"
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-    if hwnd:
-        ico_path = os.path.join(os.path.dirname(__file__), "emailsentinel.ico")
-        if os.path.exists(ico_path):
-            h_icon = ctypes.windll.user32.LoadImageW(None, ico_path, 1, 32, 32, 0x00000010 | 0x00000040)
-            if h_icon:
-                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, h_icon)
-                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, h_icon)
+    if hwnd and os.path.exists(ICO_PATH):
+        h_icon = ctypes.windll.user32.LoadImageW(None, ICO_PATH, 1, 32, 32, 0x00000010 | 0x00000040)
+        if h_icon:
+            ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, h_icon)
+            ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, h_icon)
 except Exception:
     pass
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
-HISTORY_PATH = os.path.join(os.path.dirname(__file__), "alerts_history.json")
-SEEN_PATH = os.path.join(os.path.dirname(__file__), "processed_ids.json")
-
-console = Console()
-
 class EmailSentinel:
     def __init__(self):
-        self.lock_socket = self.acquire_single_instance_lock()
+        self.lock_mutex = self.acquire_single_instance_lock()
         self.config = self.load_config()
         self.running = True
         self.last_scan_time = "Never"
@@ -57,15 +63,21 @@ class EmailSentinel:
         self.sound_enabled = self.config.get("sound_alerts", True)
         self.voice_enabled = self.config.get("voice_tts", True)
         self.toast_enabled = self.config.get("toast_notifications", True)
+        self.tray_icon = None
 
     def acquire_single_instance_lock(self):
-        """Prevent multiple instances from running simultaneously using Windows Named Mutex."""
+        """Prevent multiple instances. If one exists, restore and bring it to front."""
         try:
             import win32event, win32api, winerror
             mutex = win32event.CreateMutex(None, False, "Global\\EmailSentinel_SingleInstance_Mutex")
             if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
-                console.print("\n[bold red]ERROR: Another instance of EmailSentinel is already running![/bold red]")
-                console.print("[yellow]Exiting to prevent duplicate notifications.[/yellow]\n")
+                console.print(f"\n[bold yellow]EmailSentinel is already active in your Taskbar / System Tray.[/bold yellow]")
+                console.print("[white]Bringing active window to front...[/white]\n")
+                # Unhide existing window and bring to foreground
+                hwnd = win32gui.FindWindow(None, APP_TITLE)
+                if hwnd:
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                    win32gui.SetForegroundWindow(hwnd)
                 time.sleep(2)
                 sys.exit(0)
             return mutex
@@ -93,7 +105,6 @@ class EmailSentinel:
     def save_processed_ids(self):
         try:
             with open(SEEN_PATH, "w", encoding="utf-8") as f:
-                # Keep latest 1000 IDs
                 json.dump(list(self.processed_ids)[-1000:], f)
         except Exception:
             pass
@@ -167,19 +178,17 @@ class EmailSentinel:
             self.connection_status = "ONLINE"
             mail.select("INBOX", readonly=True)
 
-            # 1. First-Run Baseline Calibration: Ignore all historical emails
+            # First-Run Baseline Calibration: Ignore all historical emails
             if not self.baseline_established:
-                self.status_detail = "Calibrating baseline... ignoring historical emails"
-                # Record all unread message IDs as known
+                self.status_detail = "Calibrating baseline... ignoring old emails"
                 status, unread_resp = mail.search(None, "UNSEEN")
                 if status == "OK" and unread_resp[0]:
                     for mid in unread_resp[0].split():
                         self.processed_ids.add(mid.decode("utf-8", errors="ignore"))
 
-                # Record last 50 total message IDs as known
                 status, all_resp = mail.search(None, "ALL")
                 if status == "OK" and all_resp[0]:
-                    for mid in all_resp[0].split()[-50:]:
+                    for mid in all_resp[0].split()[-100:]:
                         self.processed_ids.add(mid.decode("utf-8", errors="ignore"))
 
                 self.baseline_established = True
@@ -190,7 +199,7 @@ class EmailSentinel:
                 mail.logout()
                 return
 
-            # 2. Routine Polling: Only check unread (UNSEEN) emails
+            # Routine Polling: Only check unread (UNSEEN) emails
             status, unread_resp = mail.search(None, "UNSEEN")
             candidate_ids = []
             if status == "OK" and unread_resp[0]:
@@ -206,7 +215,6 @@ class EmailSentinel:
                 self.processed_ids.add(msg_id_str)
                 self.save_processed_ids()
 
-                # Fetch headers
                 status, data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
                 if status != "OK" or not data or not data[0]:
                     continue
@@ -266,6 +274,43 @@ class EmailSentinel:
                 time.sleep(1)
                 self.next_poll_countdown -= 1
 
+    def show_console(self):
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+
+    def hide_console(self):
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+
+    def setup_tray_icon(self):
+        if not os.path.exists(ICO_PATH):
+            return
+        try:
+            image = Image.open(ICO_PATH)
+            menu = pystray.Menu(
+                item("Show Console HUD", lambda: self.show_console(), default=True),
+                item("Hide to System Tray", lambda: self.hide_console()),
+                pystray.Menu.SEPARATOR,
+                item("Scan Inbox Now", lambda: threading.Thread(target=self.check_inbox, daemon=True).start()),
+                item("Test Alert", lambda: notifier.trigger_notification("LEGAL", "Tyler Gray", "Test settlement alert", toast=True, voice=True)),
+                item("Open Web Gmail", lambda: webbrowser.open("https://mail.google.com")),
+                pystray.Menu.SEPARATOR,
+                item("Quit EmailSentinel", lambda: self.quit_app())
+            )
+            self.tray_icon = pystray.Icon("EmailSentinel", image, APP_TITLE, menu)
+            self.tray_icon.run()
+        except Exception:
+            pass
+
+    def quit_app(self):
+        self.running = False
+        if self.tray_icon:
+            self.tray_icon.stop()
+        sys.exit(0)
+
     def build_layout(self):
         layout = Layout()
         layout.split_column(
@@ -274,20 +319,17 @@ class EmailSentinel:
             Layout(name="footer", size=3)
         )
 
-        # Header
         header_text = Text()
         header_text.append("EMAIL SENTINEL ", style="bold green")
         header_text.append("| PRIORITY INBOX MONITOR & RAPID TRIAGE HUD", style="bold white")
         header_panel = Panel(header_text, style="green on #030508", border_style="green")
         layout["header"].update(header_panel)
 
-        # Main Area: Split horizontal
         layout["main"].split_row(
             Layout(name="status_panel", ratio=1),
             Layout(name="alerts_table", ratio=2)
         )
 
-        # Status & Channels
         status_table = Table(box=None, expand=True, show_header=False)
         status_table.add_column("Key", style="bold cyan", width=16)
         status_table.add_column("Val", style="bold white")
@@ -320,7 +362,6 @@ class EmailSentinel:
         )
         layout["main"]["status_panel"].update(Panel(status_content, title="Sentinel Telemetry", border_style="cyan"))
 
-        # Alerts Stream
         alerts_table = Table(expand=True, border_style="blue")
         alerts_table.add_column("Time", style="dim", width=10)
         alerts_table.add_column("Category", style="bold", width=16)
@@ -342,18 +383,19 @@ class EmailSentinel:
 
         layout["main"]["alerts_table"].update(Panel(alerts_table, title="Live Priority Triage Alerts", border_style="green"))
 
-        # Footer
         footer_text = Text(" CONTROLS: ", style="bold yellow")
+        footer_text.append("[H] ", style="bold cyan")
+        footer_text.append("Hide to Tray  |  ", style="white")
         footer_text.append("[S] ", style="bold green")
         footer_text.append("Scan Now  |  ", style="white")
         footer_text.append("[O] ", style="bold cyan")
-        footer_text.append("Open Web Gmail  |  ", style="white")
+        footer_text.append("Open Gmail  |  ", style="white")
         footer_text.append("[T] ", style="bold magenta")
-        footer_text.append("Test Alert Popup  |  ", style="white")
+        footer_text.append("Test Alert  |  ", style="white")
         footer_text.append("[M] ", style="bold yellow")
         footer_text.append("Toggle Audio  |  ", style="white")
         footer_text.append("[Q] ", style="bold red")
-        footer_text.append("Quit Sentinel", style="white")
+        footer_text.append("Quit", style="white")
 
         footer_panel = Panel(footer_text, style="white on #030508", border_style="yellow")
         layout["footer"].update(footer_panel)
@@ -364,13 +406,18 @@ class EmailSentinel:
         worker_thread = threading.Thread(target=self.background_poll_worker, daemon=True)
         worker_thread.start()
 
+        tray_thread = threading.Thread(target=self.setup_tray_icon, daemon=True)
+        tray_thread.start()
+
         with Live(self.build_layout(), refresh_per_second=2, screen=True) as live:
             while self.running:
                 if msvcrt.kbhit():
                     ch = msvcrt.getch().decode("utf-8", errors="ignore").lower()
                     if ch == "q":
-                        self.running = False
+                        self.quit_app()
                         break
+                    elif ch == "h":
+                        self.hide_console()
                     elif ch == "s":
                         threading.Thread(target=self.check_inbox, daemon=True).start()
                     elif ch == "o":
